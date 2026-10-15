@@ -1,34 +1,88 @@
-name: Deploy pagin estatica en pages
+name: Publicar React y desplegar en la VM
 
 on:
   push:
-    branches:
-      - main
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: react-vm-production
+  cancel-in-progress: false
+
+env:
+  VM_HOST: 147.15.84.247
+  VM_SSH_PORT: ${{ vars.VM_SSH_PORT || '22' }}
+  VM_HTTP_PORT: ${{ vars.VM_HTTP_PORT || '80' }}
+  IMAGE_REPOSITORY: mi-web-plana
 
 jobs:
-  build-and-push:
+  build-push-deploy:
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout repository
+      - name: Descargar el código
         uses: actions/checkout@v6
 
-      - name: Iniciar sesion en Docker Hub
+      - name: Preparar Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: Verificar React
+        run: |
+          npm ci
+          npm run lint
+          npm run build
+
+      - name: Iniciar sesión en Docker Hub
         uses: docker/login-action@v4
         with:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_PASSWORD }}
-        
 
-      - name: Configurar Docker Build
-        uses: docker/setup-buildx-action@v3
+      - name: Preparar Docker Buildx
+        uses: docker/setup-buildx-action@v4
 
-      - name: Construir y publicar imagen de Dockerhub
-        uses: docker/build-push-action@v5
+      - name: Publicar imagen en Docker Hub
+        uses: docker/build-push-action@v7
         with:
-          context:
+          context: .
           file: ./Dockerfile
           push: true
           tags: |
             ${{ secrets.DOCKER_USERNAME }}/mi-web-plana:latest
             ${{ secrets.DOCKER_USERNAME }}/mi-web-plana:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Preparar conexión SSH verificada
+        env:
+          VM_SSH_PRIVATE_KEY: ${{ secrets.VM_SSH_PRIVATE_KEY }}
+          VM_SSH_KNOWN_HOSTS: ${{ secrets.VM_SSH_KNOWN_HOSTS }}
+        run: |
+          test -n "$VM_SSH_PRIVATE_KEY" || { echo 'Falta VM_SSH_PRIVATE_KEY'; exit 1; }
+          test -n "$VM_SSH_KNOWN_HOSTS" || { echo 'Falta VM_SSH_KNOWN_HOSTS'; exit 1; }
+          install -m 700 -d "$RUNNER_TEMP/deploy-ssh"
+          printf '%s\n' "$VM_SSH_PRIVATE_KEY" | tr -d '\r' > "$RUNNER_TEMP/deploy-ssh/id_vm"
+          printf '%s\n' "$VM_SSH_KNOWN_HOSTS" > "$RUNNER_TEMP/deploy-ssh/known_hosts"
+          chmod 600 "$RUNNER_TEMP/deploy-ssh/id_vm" "$RUNNER_TEMP/deploy-ssh/known_hosts"
+
+      - name: Desplegar imagen en la VM
+        env:
+          DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+          VM_SSH_USER: ${{ secrets.VM_SSH_USER }}
+        run: |
+          test -n "$VM_SSH_USER" || { echo 'Falta VM_SSH_USER'; exit 1; }
+          image="$DOCKER_USERNAME/$IMAGE_REPOSITORY:$GITHUB_SHA"
+          ssh -p "$VM_SSH_PORT" \
+            -i "$RUNNER_TEMP/deploy-ssh/id_vm" \
+            -o UserKnownHostsFile="$RUNNER_TEMP/deploy-ssh/known_hosts" \
+            -o StrictHostKeyChecking=yes \
+            -o IdentitiesOnly=yes \
+            -o BatchMode=yes \
+            -o ConnectTimeout=15 \
+            "$VM_SSH_USER@$VM_HOST" \
+            bash -s -- "$image" "$VM_HTTP_PORT" < .github/scripts/deploy-vm.sh
